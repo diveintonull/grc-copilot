@@ -537,6 +537,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "markdownify" },
     { name = "mineru", extra = ["core"] },
+    { name = "openai" },
     { name = "pymupdf4llm" },
     { name = "qdrant-client" },
     { name = "sentence-transformers" },
@@ -551,6 +552,7 @@ dev = [
 requires-dist = [
     { name = "markdownify", specifier = ">=1.2.3" },
     { name = "mineru", extras = ["core"], specifier = ">=3.4.3" },
+    { name = "openai", specifier = ">=2.44.0" },
     { name = "pymupdf4llm", specifier = ">=1.28.0" },
     { name = "qdrant-client", specifier = ">=1.18.0" },
     { name = "sentence-transformers", specifier = ">=5.6.0" },

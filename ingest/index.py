@@ -1,4 +1,4 @@
-"""Embed child chunks with bge-m3 and index them in Qdrant (P1-06).
+"""Embed child chunks with bge-m3 and index them in Qdrant.
 
 Only children are embedded and searched; parents are written to a separate JSON
 store (not vectorised) for small-to-big expansion at query time.

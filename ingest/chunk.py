@@ -1,4 +1,4 @@
-"""Naive fixed-size chunker (P1-04).
+"""Naive fixed-size chunker.
 
 Splits text into fixed-length, overlapping windows and wraps each in a uniform
 Chunk (id / text / metadata). This is the baseline; the parent-child chunker
