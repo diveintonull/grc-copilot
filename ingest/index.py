@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 from ingest.chunk import Chunk
 from ingest.chunk_parent import PARSED, Section, build_parent_child
+from ingest.schema import DocumentMeta, content_sha256
 
 # Per-document segmentation strategy (GB/T standards + GDPR are heading-numbered;
 # PRC statutes are article-numbered).
@@ -30,11 +32,69 @@ STRATEGY = {
     "data-security-law": "articles",
 }
 
+DOCUMENT_SPECS = {
+    "GBT+22239-2019": {
+        "source_id": "GBT-22239",
+        "title": "网络安全等级保护基本要求",
+        "jurisdiction": "CN",
+        "version": "2019",
+        "effective_date": None,
+        "source_url": "https://openstd.samr.gov.cn/",
+    },
+    "GBT+35273-2020": {
+        "source_id": "GBT-35273",
+        "title": "个人信息安全规范",
+        "jurisdiction": "CN",
+        "version": "2020",
+        "effective_date": None,
+        "source_url": "https://openstd.samr.gov.cn/",
+    },
+    "CELEX_32016R0679_EN_TXT": {
+        "source_id": "GDPR",
+        "title": "General Data Protection Regulation",
+        "jurisdiction": "EU",
+        "version": "2016-679",
+        "effective_date": date(2018, 5, 25),
+        "source_url": "https://eur-lex.europa.eu/eli/reg/2016/679/oj",
+    },
+    "cybersecurity-law": {
+        "source_id": "cybersecurity-law",
+        "title": "中华人民共和国网络安全法",
+        "jurisdiction": "CN",
+        "version": "2025-amended",
+        "effective_date": None,
+        "source_url": "https://www.cac.gov.cn/",
+    },
+    "data-security-law": {
+        "source_id": "data-security-law",
+        "title": "中华人民共和国数据安全法",
+        "jurisdiction": "CN",
+        "version": "2021",
+        "effective_date": date(2021, 9, 1),
+        "source_url": "https://www.cac.gov.cn/",
+    },
+}
+
 COLLECTION = "grc_kb"
 MODEL_NAME = "BAAI/bge-m3"
 BGE_M3_DIM = 1024
 QDRANT_URL = "http://localhost:6333"
 PARENTS_STORE = PARSED / "_parents_store.json"
+
+
+def document_meta_for(path: Path, text: str) -> DocumentMeta:
+    """Build provenance for a parsed corpus file, with a safe local fallback."""
+    spec = DOCUMENT_SPECS.get(path.stem)
+    if spec is None:
+        spec = {
+            "source_id": path.stem,
+            "title": path.stem,
+            "jurisdiction": "UNKNOWN",
+            "version": "unversioned",
+            "effective_date": None,
+            "source_url": f"file://{path.as_posix()}",
+        }
+    return DocumentMeta(**spec, content_hash=content_sha256(text))
 
 
 def strip_heading(text: str) -> str:
@@ -60,12 +120,18 @@ def build_corpus() -> tuple[list[Section], list[Chunk]]:
     parents_all: list[Section] = []
     children_all: list[Chunk] = []
     for md in sorted(PARSED.glob("*.md")):
+        text = md.read_text(encoding="utf-8")
+        document = document_meta_for(md, text)
         strategy = STRATEGY.get(md.stem, "headings")
         parents, children = build_parent_child(
-            md.read_text(encoding="utf-8"), doc_id=md.stem, strategy=strategy
+            text,
+            doc_id=document.document_id,
+            strategy=strategy,
+            metadata=document.to_payload(),
         )
         for c in children:
-            c.metadata["source"] = md.stem
+            c.metadata["source"] = document.source_id
+            c.metadata["document_id"] = document.document_id
         parents_all.extend(parents)
         children_all.extend(children)
     return filter_stubs(parents_all, children_all)
@@ -104,7 +170,13 @@ def index() -> int:
 
     # Parents: stored whole, not embedded.
     store = {
-        p.id: {"text": p.text, "number": p.number, "title": p.title, "level": p.level}
+        p.id: {
+            "text": p.text,
+            "number": p.number,
+            "title": p.title,
+            "level": p.level,
+            "metadata": p.metadata,
+        }
         for p in parents
     }
     PARENTS_STORE.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
@@ -125,6 +197,7 @@ def index() -> int:
             id=i,
             vector=vectors[i].tolist(),
             payload={
+                **c.metadata,
                 "chunk_id": c.id,
                 "text": c.text,
                 "parent_id": c.metadata["parent_id"],
