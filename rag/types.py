@@ -25,4 +25,6 @@ class SearchHit:
     source_id: str
     version: str
     section_number: str
-
+    dense_rank: int | None = None
+    sparse_rank: int | None = None
+    rerank_score: float | None = None

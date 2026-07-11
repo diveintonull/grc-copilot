@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from ingest.index import PARENTS_STORE
 from rag.dense import search_dense
+from rag.fusion import reciprocal_rank_fusion
+from rag.rerank import rerank_hits
+from rag.sparse import search_sparse
 from rag.types import RetrievalConfig, SearchHit
 
 
@@ -28,15 +32,32 @@ def expand_parent_hits(
                 source_id=hit.source_id,
                 version=hit.version,
                 section_number=hit.section_number,
+                dense_rank=hit.dense_rank,
+                sparse_rank=hit.sparse_rank,
+                rerank_score=hit.rerank_score,
             )
         )
     return expanded
 
 
 def retrieve(query: str, config: RetrievalConfig) -> list[SearchHit]:
-    """Run the Dense baseline and optionally expand matching children to parents."""
-    child_hits = search_dense(query, k=config.dense_k)
-    if not config.expand_parent:
-        return child_hits[: config.fused_k]
-    parent_store = json.loads(PARENTS_STORE.read_text(encoding="utf-8"))
-    return expand_parent_hits(child_hits, parent_store)[: config.fused_k]
+    """Run switchable Dense, Sparse, fusion, parent expansion, and reranking."""
+    dense_hits = search_dense(query, k=config.dense_k)
+    if config.use_sparse:
+        sparse_hits = search_sparse(query, k=config.sparse_k)
+        candidates = reciprocal_rank_fusion(
+            dense_hits, sparse_hits, limit=config.fused_k
+        )
+    else:
+        candidates = [
+            replace(hit, dense_rank=rank)
+            for rank, hit in enumerate(dense_hits[: config.fused_k], start=1)
+        ]
+
+    if config.expand_parent:
+        parent_store = json.loads(PARENTS_STORE.read_text(encoding="utf-8"))
+        candidates = expand_parent_hits(candidates, parent_store)
+
+    if config.use_rerank:
+        return rerank_hits(query, candidates, limit=config.rerank_k)
+    return candidates[: config.fused_k]
