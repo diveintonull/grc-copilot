@@ -93,6 +93,8 @@ class FakeLLM:
         answer: str = "grounded regulation answer",
         comparison_plan: dict | None = None,
         comparison_answer: str = "grounded comparison answer",
+        extracted_controls: list[dict] | None = None,
+        gap_matrix: list[dict] | None = None,
     ) -> None:
         self.answer = answer
         self.calls: list[dict] = []
@@ -112,6 +114,10 @@ class FakeLLM:
         self.comparison_answer = comparison_answer
         self.plan_calls: list[dict] = []
         self.comparison_answer_calls: list[dict] = []
+        self.extracted_controls = list(extracted_controls or [])
+        self.gap_matrix = list(gap_matrix or [])
+        self.control_extraction_calls: list[dict] = []
+        self.gap_mapping_calls: list[dict] = []
 
     def answer_regulation(self, query: str, evidence: list[dict]) -> str:
         self.calls.append({"query": query, "evidence": evidence})
@@ -126,6 +132,27 @@ class FakeLLM:
             {"query": query, "comparison": comparison}
         )
         return self.comparison_answer
+
+    def extract_controls(self, control_text: str) -> list[dict]:
+        self.control_extraction_calls.append(
+            {"control_text": control_text}
+        )
+        return list(self.extracted_controls)
+
+    def map_gaps(
+        self,
+        query: str,
+        controls: list[dict],
+        evidence: list[dict],
+    ) -> list[dict]:
+        self.gap_mapping_calls.append(
+            {
+                "query": query,
+                "controls": controls,
+                "evidence": evidence,
+            }
+        )
+        return list(self.gap_matrix)
 
 @pytest.fixture
 def fake_tools() -> FakeTools:
@@ -204,37 +231,6 @@ def test_select_workflow_routes_unsupported_to_unsupported_node() -> None:
     next_node = select_workflow(state)
 
     assert next_node == "execute_unsupported"
-
-
-@pytest.mark.parametrize(
-    ("intent", "workflow_node", "expected_answer", "expected_node"),
-    [
-        (
-            "gap_analysis",
-            execute_gap_analysis,
-            "fake gap_analysis result",
-            "execute_gap_analysis",
-        ),
-    ],
-)
-def test_supported_fake_workflow_returns_answer_and_trace(
-    intent: str,
-    workflow_node,
-    expected_answer: str,
-    expected_node: str,
-) -> None:
-    state: AgentState = {
-        "intent": intent,
-        "trace": [{"node": "route_intent", "intent": intent}],
-    }
-
-    update = workflow_node(state)
-
-    assert update["answer"] == expected_answer
-    assert update["trace"] == [
-        {"node": "route_intent", "intent": intent},
-        {"node": expected_node},
-    ]
 
 
 def test_unsupported_workflow_refuses_without_calling_tools(
@@ -495,6 +491,232 @@ def test_graph_injects_dependencies_into_clause_comparison() -> None:
     ]
 
 
+def test_gap_analysis_requests_control_text_without_calling_dependencies() -> None:
+    tools = FakeTools(search_results=[{"source_id": "SHOULD-NOT-BE-USED"}])
+    llm = FakeLLM(
+        extracted_controls=[{"control": "should not be extracted"}],
+        gap_matrix=[{"gap": "should not be mapped"}],
+    )
+    state: AgentState = {
+        "query": "检查管理员身份鉴别控制",
+        "control_text": "   ",
+        "tool_calls": [],
+        "trace": [{"node": "route_intent", "intent": "gap_analysis"}],
+    }
+
+    update = execute_gap_analysis(state, tools, llm)
+
+    assert update["answer"] == "control description required"
+    assert update["evidence"] == []
+    assert update["tool_calls"] == []
+    assert update["trace"][-1] == {
+        "node": "execute_gap_analysis",
+        "reason": "missing_control_text",
+        "gap_count": 0,
+    }
+    assert tools.calls == []
+    assert llm.control_extraction_calls == []
+    assert llm.gap_mapping_calls == []
+
+
+def test_gap_analysis_builds_grounded_matrix_with_human_boundary() -> None:
+    regulation_evidence = [
+        {
+            "parent_id": "GBT-22239@2019#8.1.4.1",
+            "source_id": "GBT-22239",
+            "version": "2019",
+            "section_number": "8.1.4.1",
+            "text": "应采用两种或两种以上组合的鉴别技术。",
+            "score": 0.94,
+        }
+    ]
+    controls = [
+        {
+            "control": "管理员登录",
+            "current_state": "管理员仅使用密码登录。",
+        }
+    ]
+    gap_matrix = [
+        {
+            "requirement": "管理员应采用多因素身份鉴别。",
+            "current_state": "管理员仅使用密码登录。",
+            "gap": "制度未说明第二种身份鉴别因素。",
+            "risk": "密码泄露后可能导致管理账户被冒用。",
+            "recommendation": "补充多因素认证要求并核对实际配置。",
+            "evidence": [regulation_evidence[0]],
+        }
+    ]
+    tools = FakeTools(search_results=regulation_evidence)
+    llm = FakeLLM(extracted_controls=controls, gap_matrix=gap_matrix)
+    state: AgentState = {
+        "query": "检查管理员身份鉴别控制",
+        "control_text": "管理员仅使用密码登录。",
+        "tool_calls": [],
+        "trace": [{"node": "route_intent", "intent": "gap_analysis"}],
+    }
+
+    update = execute_gap_analysis(state, tools, llm)
+
+    assert tools.calls == [
+        {
+            "tool": "search_regulation",
+            "query": state["query"],
+            "source_ids": None,
+        }
+    ]
+    assert llm.control_extraction_calls == [
+        {"control_text": state["control_text"]}
+    ]
+    assert llm.gap_mapping_calls == [
+        {
+            "query": state["query"],
+            "controls": controls,
+            "evidence": regulation_evidence,
+        }
+    ]
+    assert update["evidence"] == gap_matrix
+    assert all(row["evidence"] for row in update["evidence"])
+    assert update["tool_calls"][-1] == {
+        "tool": "search_regulation",
+        "query": state["query"],
+        "source_ids": None,
+        "result_count": 1,
+    }
+    for field in (
+        "requirement",
+        "current_state",
+        "gap",
+        "risk",
+        "recommendation",
+        "evidence",
+    ):
+        assert field in update["answer"]
+    assert "人工确认" in update["answer"]
+    assert "企业已经合规" not in update["answer"]
+    assert "企业已经违法" not in update["answer"]
+    assert update["trace"][-1] == {
+        "node": "execute_gap_analysis",
+        "result_count": 1,
+        "gap_count": 1,
+        "human_confirmation_required": True,
+    }
+
+
+def test_gap_analysis_refuses_empty_regulation_evidence_without_mapping() -> None:
+    tools = FakeTools(search_results=[])
+    llm = FakeLLM(
+        extracted_controls=[{"current_state": "管理员仅使用密码登录。"}],
+        gap_matrix=[{"gap": "must not be generated"}],
+    )
+    state: AgentState = {
+        "query": "检查管理员身份鉴别控制",
+        "control_text": "管理员仅使用密码登录。",
+        "tool_calls": [],
+        "trace": [{"node": "route_intent", "intent": "gap_analysis"}],
+    }
+
+    update = execute_gap_analysis(state, tools, llm)
+
+    assert update["answer"] == "insufficient regulation evidence"
+    assert update["evidence"] == []
+    assert update["tool_calls"][-1]["result_count"] == 0
+    assert llm.control_extraction_calls == [
+        {"control_text": state["control_text"]}
+    ]
+    assert llm.gap_mapping_calls == []
+    assert update["trace"][-1] == {
+        "node": "execute_gap_analysis",
+        "result_count": 0,
+        "gap_count": 0,
+        "human_confirmation_required": True,
+    }
+
+
+def test_graph_injects_dependencies_into_gap_analysis() -> None:
+    clause = {
+        "source_id": "GBT-22239",
+        "version": "2019",
+        "section_number": "8.1.4.1",
+        "text": "应采用两种或两种以上组合的鉴别技术。",
+    }
+    gap_matrix = [
+        {
+            "requirement": "管理员应采用多因素身份鉴别。",
+            "current_state": "管理员仅使用密码登录。",
+            "gap": "制度未说明第二种身份鉴别因素。",
+            "risk": "管理账户可能被冒用。",
+            "recommendation": "补充多因素认证要求。",
+            "evidence": [clause],
+        }
+    ]
+    tools = FakeTools(search_results=[clause])
+    llm = FakeLLM(
+        extracted_controls=[{"current_state": "管理员仅使用密码登录。"}],
+        gap_matrix=gap_matrix,
+    )
+    graph = build_graph(
+        lambda _query, _control_text: "gap_analysis",
+        tools,
+        llm,
+    )
+
+    result = graph.invoke(
+        {
+            "request_id": "req-gap-analysis",
+            "query": "检查管理员身份鉴别控制",
+            "control_text": "管理员仅使用密码登录。",
+            "tool_calls": [],
+            "trace": [{"node": "received"}],
+        }
+    )
+
+    assert result["evidence"] == gap_matrix
+    assert result["citations_valid"] is True
+    assert result["final_status"] == "completed"
+    assert [call["tool"] for call in tools.calls] == ["search_regulation"]
+
+
+def test_graph_refuses_gap_analysis_with_unbound_gap() -> None:
+    clause = {
+        "source_id": "GBT-22239",
+        "version": "2019",
+        "section_number": "8.1.4.1",
+        "text": "应采用两种或两种以上组合的鉴别技术。",
+    }
+    tools = FakeTools(search_results=[clause])
+    llm = FakeLLM(
+        extracted_controls=[{"current_state": "管理员仅使用密码登录。"}],
+        gap_matrix=[
+            {
+                "requirement": "管理员应采用多因素身份鉴别。",
+                "current_state": "管理员仅使用密码登录。",
+                "gap": "制度未说明第二种身份鉴别因素。",
+                "risk": "管理账户可能被冒用。",
+                "recommendation": "补充多因素认证要求。",
+                "evidence": [],
+            }
+        ],
+    )
+    graph = build_graph(
+        lambda _query, _control_text: "gap_analysis",
+        tools,
+        llm,
+    )
+
+    result = graph.invoke(
+        {
+            "request_id": "req-unbound-gap",
+            "query": "检查管理员身份鉴别控制",
+            "control_text": "管理员仅使用密码登录。",
+            "tool_calls": [],
+            "trace": [{"node": "received"}],
+        }
+    )
+
+    assert result["citations_valid"] is False
+    assert result["final_status"] == "refused"
+
+
 @pytest.mark.parametrize(
     ("intent", "evidence", "expected_valid"),
     [
@@ -506,7 +728,18 @@ def test_graph_injects_dependencies_into_clause_comparison() -> None:
             True,
         ),
         ("clause_comparison", [{"source_id": "LEFT"}], False),
-        ("gap_analysis", [], True),
+        (
+            "gap_analysis",
+            [
+                {
+                    "gap": "制度未说明第二种身份鉴别因素。",
+                    "evidence": [{"source_id": "GBT-22239"}],
+                }
+            ],
+            True,
+        ),
+        ("gap_analysis", [{"gap": "unbound", "evidence": []}], False),
+        ("gap_analysis", [], False),
         ("unsupported", [], False),
     ],
 )
@@ -520,6 +753,8 @@ def test_verify_records_deterministic_result(
         "evidence": evidence,
         "trace": [{"node": "execute_workflow"}],
     }
+    if intent == "gap_analysis":
+        state["answer"] = "这是初步差距分析，最终结果需要人工确认。"
 
     update = verify(state)
 
@@ -553,6 +788,48 @@ def test_finish_sets_explicit_status_and_trace(
         {"node": "verify"},
         {"node": "finish", "final_status": expected_status},
     ]
+
+
+@pytest.mark.parametrize(
+    "unsafe_claim",
+    ["企业已经合规", "企业已经违法"],
+)
+def test_verify_rejects_gap_analysis_overclaim(unsafe_claim: str) -> None:
+    state: AgentState = {
+        "intent": "gap_analysis",
+        "answer": f"{unsafe_claim}，无需进一步检查。人工确认。",
+        "evidence": [
+            {
+                "gap": "制度与法规要求存在差异。",
+                "evidence": [{"source_id": "GBT-22239"}],
+            }
+        ],
+        "trace": [{"node": "execute_gap_analysis"}],
+    }
+
+    update = verify(state)
+
+    assert update["citations_valid"] is False
+    assert unsafe_claim not in update["answer"]
+    assert "人工确认" in update["answer"]
+
+
+def test_verify_requires_human_confirmation_for_gap_analysis() -> None:
+    state: AgentState = {
+        "intent": "gap_analysis",
+        "answer": "这是基于法规证据形成的初步差距建议。",
+        "evidence": [
+            {
+                "gap": "制度未说明第二种身份鉴别因素。",
+                "evidence": [{"source_id": "GBT-22239"}],
+            }
+        ],
+        "trace": [{"node": "execute_gap_analysis"}],
+    }
+
+    update = verify(state)
+
+    assert update["citations_valid"] is False
 
 
 def test_graph_refuses_regulation_qa_without_evidence() -> None:
@@ -634,8 +911,8 @@ def test_graph_refuses_comparison_with_one_missing_side() -> None:
         (
             "gap_analysis",
             "execute_gap_analysis",
-            "completed",
-            True,
+            "refused",
+            False,
         ),
         (
             "unsupported",

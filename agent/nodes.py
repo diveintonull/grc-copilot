@@ -5,6 +5,47 @@ from __future__ import annotations
 from agent.state import AgentState
 
 
+GAP_MATRIX_FIELDS = (
+    "requirement",
+    "current_state",
+    "gap",
+    "risk",
+    "recommendation",
+)
+GAP_ANALYSIS_DISCLAIMER = "以下为初步差距分析，最终结果需要人工确认。"
+GAP_ANALYSIS_OVERCLAIM_REFUSAL = (
+    "差距分析包含越权结论，已拒绝输出；最终结果需要人工确认。"
+)
+GAP_ANALYSIS_UNSAFE_CLAIMS = (
+    "企业已经合规",
+    "企业已合规",
+    "企业已经违法",
+    "企业已违法",
+    "the enterprise is compliant",
+    "the enterprise is illegal",
+)
+
+
+def format_gap_matrix(gap_matrix: list[dict]) -> str:
+    """Format grounded gap rows with an explicit human-review boundary."""
+    lines = [GAP_ANALYSIS_DISCLAIMER]
+
+    for index, row in enumerate(gap_matrix, start=1):
+        lines.append(f"gap_item: {index}")
+        for field in GAP_MATRIX_FIELDS:
+            lines.append(f"{field}: {row.get(field, '')}")
+
+        references = []
+        for item in row.get("evidence", []):
+            source_id = item.get("source_id", "")
+            version = item.get("version", "")
+            section_number = item.get("section_number", "")
+            references.append(f"{source_id}@{version}#{section_number}")
+        lines.append(f"evidence: {', '.join(references)}")
+
+    return "\n".join(lines)
+
+
 def route_intent(state: AgentState, classify_intent) -> dict:
     """Classify one request and return its intent state update."""
     intent = classify_intent(state["query"], state["control_text"])
@@ -114,11 +155,59 @@ def execute_clause_comparison(state: AgentState, tools, llm) -> dict:
     }
 
 
-def execute_gap_analysis(state: AgentState) -> dict:
-    """Return a deterministic placeholder for the gap-analysis route."""
+def execute_gap_analysis(state: AgentState, tools, llm) -> dict:
+    """Build an evidence-linked control gap matrix for human review."""
+    query = state["query"]
+    control_text = state.get("control_text", "").strip()
+    previous_tool_calls = state.get("tool_calls", [])
+
+    if not control_text:
+        return {
+            "answer": "control description required",
+            "tool_calls": previous_tool_calls,
+            "evidence": [],
+            "trace": state["trace"] + [
+                {
+                    "node": "execute_gap_analysis",
+                    "reason": "missing_control_text",
+                    "gap_count": 0,
+                }
+            ],
+        }
+
+    controls = llm.extract_controls(control_text)
+    regulation_evidence = tools.search_regulation(query, None)
+    tool_call = {
+        "tool": "search_regulation",
+        "query": query,
+        "source_ids": None,
+        "result_count": len(regulation_evidence),
+    }
+
+    if regulation_evidence:
+        gap_matrix = llm.map_gaps(query, controls, regulation_evidence)
+    else:
+        gap_matrix = []
+
+    if gap_matrix:
+        answer = format_gap_matrix(gap_matrix)
+    elif regulation_evidence:
+        answer = "insufficient gap analysis evidence"
+    else:
+        answer = "insufficient regulation evidence"
+
     return {
-        "answer": "fake gap_analysis result",
-        "trace": state["trace"] + [{"node": "execute_gap_analysis"}],
+        "answer": answer,
+        "tool_calls": previous_tool_calls + [tool_call],
+        "evidence": gap_matrix,
+        "trace": state["trace"] + [
+            {
+                "node": "execute_gap_analysis",
+                "result_count": len(regulation_evidence),
+                "gap_count": len(gap_matrix),
+                "human_confirmation_required": True,
+            }
+        ],
     }
 
 
@@ -134,17 +223,33 @@ def verify(state: AgentState) -> dict:
     """Return the deterministic verification update for a routed request."""
     intent = state["intent"]
     evidence = state.get("evidence", [])
+    has_unsafe_claim = False
 
     if intent == "regulation_qa":
         citations_valid = bool(evidence)
     elif intent == "clause_comparison":
         citations_valid = len(evidence) == 2
     elif intent == "gap_analysis":
-        citations_valid = True
+        answer = state.get("answer", "")
+        normalized_answer = answer.casefold()
+        has_unsafe_claim = any(
+            claim.casefold() in normalized_answer
+            for claim in GAP_ANALYSIS_UNSAFE_CLAIMS
+        )
+        every_gap_has_evidence = bool(evidence) and all(
+            isinstance(row, dict) and bool(row.get("evidence"))
+            for row in evidence
+        )
+        has_human_boundary = "人工确认" in answer
+        citations_valid = (
+            every_gap_has_evidence
+            and has_human_boundary
+            and not has_unsafe_claim
+        )
     else:
         citations_valid = False
 
-    return {
+    update = {
         "citations_valid": citations_valid,
         "trace": state["trace"] + [
             {
@@ -153,6 +258,9 @@ def verify(state: AgentState) -> dict:
             }
         ],
     }
+    if intent == "gap_analysis" and has_unsafe_claim:
+        update["answer"] = GAP_ANALYSIS_OVERCLAIM_REFUSAL
+    return update
 
 
 def finish(state: AgentState) -> dict:

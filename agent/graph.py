@@ -44,11 +44,16 @@ def build_graph(classify_intent, tools, llm) -> Any:
         tools=tools,
         llm=llm,
     )
+    gap_analysis_node = partial(
+        execute_gap_analysis,
+        tools=tools,
+        llm=llm,
+    )
 
     builder.add_node("route_intent", route_node)
     builder.add_node("execute_regulation_qa", regulation_qa_node)
     builder.add_node("execute_clause_comparison", comparison_node)
-    builder.add_node("execute_gap_analysis", execute_gap_analysis)
+    builder.add_node("execute_gap_analysis", gap_analysis_node)
     builder.add_node("execute_unsupported", unsupported_node)
     builder.add_node("verify", verify)
     builder.add_node("finish", finish)
