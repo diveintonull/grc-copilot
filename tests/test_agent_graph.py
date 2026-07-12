@@ -19,10 +19,20 @@ from agent.state import AgentState
 
 
 class FakeTools:
-    """Fake Task11 tools whose call log can prove a path stayed tool-free."""
+    """Deterministic agent tools whose call log makes behavior observable."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        search_results: list[dict] | None = None,
+        comparison_result: dict | None = None,
+    ) -> None:
         self.calls: list[dict] = []
+        self.search_results = list(search_results or [])
+        self.comparison_result = comparison_result or {
+            "left": None,
+            "right": None,
+            "dimensions": [],
+        }
 
     def search_regulation(
         self,
@@ -36,7 +46,7 @@ class FakeTools:
                 "source_ids": source_ids,
             }
         )
-        return []
+        return list(self.search_results)
 
     def get_clause(
         self,
@@ -68,7 +78,54 @@ class FakeTools:
                 "dimensions": dimensions,
             }
         )
-        return {"left": None, "right": None, "dimensions": dimensions}
+        return {
+            "left": self.comparison_result.get("left"),
+            "right": self.comparison_result.get("right"),
+            "dimensions": list(dimensions),
+        }
+
+
+class FakeLLM:
+    """Deterministic answer generator with observable calls."""
+
+    def __init__(
+        self,
+        answer: str = "grounded regulation answer",
+        comparison_plan: dict | None = None,
+        comparison_answer: str = "grounded comparison answer",
+    ) -> None:
+        self.answer = answer
+        self.calls: list[dict] = []
+        self.comparison_plan = comparison_plan or {
+            "left": {
+                "source_id": "GBT-22239",
+                "version": "2019",
+                "section_number": "7.1.4.1",
+            },
+            "right": {
+                "source_id": "GBT-35273",
+                "version": "2020",
+                "section_number": "8.1.4",
+            },
+            "dimensions": ["requirement", "scope"],
+        }
+        self.comparison_answer = comparison_answer
+        self.plan_calls: list[dict] = []
+        self.comparison_answer_calls: list[dict] = []
+
+    def answer_regulation(self, query: str, evidence: list[dict]) -> str:
+        self.calls.append({"query": query, "evidence": evidence})
+        return self.answer
+
+    def plan_comparison(self, query: str) -> dict:
+        self.plan_calls.append({"query": query})
+        return self.comparison_plan
+
+    def answer_comparison(self, query: str, comparison: dict) -> str:
+        self.comparison_answer_calls.append(
+            {"query": query, "comparison": comparison}
+        )
+        return self.comparison_answer
 
 @pytest.fixture
 def fake_tools() -> FakeTools:
@@ -153,18 +210,6 @@ def test_select_workflow_routes_unsupported_to_unsupported_node() -> None:
     ("intent", "workflow_node", "expected_answer", "expected_node"),
     [
         (
-            "regulation_qa",
-            execute_regulation_qa,
-            "fake regulation_qa result",
-            "execute_regulation_qa",
-        ),
-        (
-            "clause_comparison",
-            execute_clause_comparison,
-            "fake clause_comparison result",
-            "execute_clause_comparison",
-        ),
-        (
             "gap_analysis",
             execute_gap_analysis,
             "fake gap_analysis result",
@@ -212,19 +257,267 @@ def test_unsupported_workflow_refuses_without_calling_tools(
     assert fake_tools.calls == []
 
 
+def test_regulation_qa_searches_once_and_records_evidence() -> None:
+    evidence = [
+        {
+            "parent_id": "GBT-22239@2019#7.1.4.1",
+            "source_id": "GBT-22239",
+            "version": "2019",
+            "section_number": "7.1.4.1",
+            "text": "应对登录用户进行身份鉴别。",
+            "score": 0.91,
+        }
+    ]
+    tools = FakeTools(search_results=evidence)
+    llm = FakeLLM()
+    state: AgentState = {
+        "query": "身份鉴别有什么要求？",
+        "tool_calls": [{"tool": "previous"}],
+        "trace": [{"node": "route_intent", "intent": "regulation_qa"}],
+    }
+
+    update = execute_regulation_qa(state, tools, llm)
+
+    assert tools.calls == [
+        {
+            "tool": "search_regulation",
+            "query": state["query"],
+            "source_ids": None,
+        }
+    ]
+    assert llm.calls == [{"query": state["query"], "evidence": evidence}]
+    assert update["tool_calls"] == [
+        {"tool": "previous"},
+        {
+            "tool": "search_regulation",
+            "query": state["query"],
+            "source_ids": None,
+            "result_count": 1,
+        },
+    ]
+    assert update["evidence"] == evidence
+    assert update["answer"] == "grounded regulation answer"
+    assert update["trace"][-1] == {
+        "node": "execute_regulation_qa",
+        "tool": "search_regulation",
+        "result_count": 1,
+    }
+
+
+def test_regulation_qa_refuses_empty_evidence_without_generation() -> None:
+    tools = FakeTools(search_results=[])
+    llm = FakeLLM()
+    state: AgentState = {
+        "query": "没有依据的问题",
+        "tool_calls": [],
+        "trace": [{"node": "route_intent", "intent": "regulation_qa"}],
+    }
+
+    update = execute_regulation_qa(state, tools, llm)
+
+    assert tools.calls == [
+        {
+            "tool": "search_regulation",
+            "query": state["query"],
+            "source_ids": None,
+        }
+    ]
+    assert llm.calls == []
+    assert update["tool_calls"][-1]["result_count"] == 0
+    assert update["evidence"] == []
+    assert update["answer"] == "insufficient regulation evidence"
+    assert update["trace"][-1] == {
+        "node": "execute_regulation_qa",
+        "tool": "search_regulation",
+        "result_count": 0,
+    }
+
+
+def test_clause_comparison_calls_tool_once_and_preserves_both_sides() -> None:
+    left_evidence = {
+        "source_id": "GBT-22239",
+        "version": "2019",
+        "section_number": "7.1.4.1",
+        "text": "Identity authentication requirements.",
+    }
+    right_evidence = {
+        "source_id": "GBT-35273",
+        "version": "2020",
+        "section_number": "8.1.4",
+        "text": "Identity management requirements.",
+    }
+    comparison = {
+        "left": left_evidence,
+        "right": right_evidence,
+        "dimensions": ["requirement", "scope"],
+    }
+    tools = FakeTools(comparison_result=comparison)
+    llm = FakeLLM()
+    state: AgentState = {
+        "query": "Compare the identity requirements in both clauses.",
+        "tool_calls": [{"tool": "previous"}],
+        "trace": [
+            {"node": "route_intent", "intent": "clause_comparison"}
+        ],
+    }
+
+    update = execute_clause_comparison(state, tools, llm)
+
+    plan = llm.comparison_plan
+    assert llm.plan_calls == [{"query": state["query"]}]
+    assert tools.calls == [
+        {
+            "tool": "compare_clauses",
+            "left": plan["left"],
+            "right": plan["right"],
+            "dimensions": plan["dimensions"],
+        }
+    ]
+    assert llm.comparison_answer_calls == [
+        {"query": state["query"], "comparison": comparison}
+    ]
+    assert update["evidence"] == [left_evidence, right_evidence]
+    assert update["answer"] == "grounded comparison answer"
+    assert update["tool_calls"][-1] == {
+        "tool": "compare_clauses",
+        "left": plan["left"],
+        "right": plan["right"],
+        "dimensions": plan["dimensions"],
+        "left_found": True,
+        "right_found": True,
+    }
+    assert update["trace"][-1] == {
+        "node": "execute_clause_comparison",
+        "tool": "compare_clauses",
+        "left_found": True,
+        "right_found": True,
+    }
+
+
+@pytest.mark.parametrize("missing_side", ["left", "right"])
+def test_clause_comparison_refuses_when_either_side_is_missing(
+    missing_side: str,
+) -> None:
+    left_evidence = {"source_id": "LEFT", "text": "left clause"}
+    right_evidence = {"source_id": "RIGHT", "text": "right clause"}
+    comparison = {
+        "left": None if missing_side == "left" else left_evidence,
+        "right": None if missing_side == "right" else right_evidence,
+        "dimensions": ["requirement", "scope"],
+    }
+    tools = FakeTools(comparison_result=comparison)
+    llm = FakeLLM()
+    state: AgentState = {
+        "query": "Compare two clauses.",
+        "tool_calls": [],
+        "trace": [
+            {"node": "route_intent", "intent": "clause_comparison"}
+        ],
+    }
+
+    update = execute_clause_comparison(state, tools, llm)
+
+    assert len(tools.calls) == 1
+    assert llm.comparison_answer_calls == []
+    assert update["evidence"] == [
+        item for item in [comparison["left"], comparison["right"]] if item
+    ]
+    assert update["answer"] == "incomplete comparison evidence"
+    assert update["tool_calls"][-1]["left_found"] is (
+        missing_side != "left"
+    )
+    assert update["tool_calls"][-1]["right_found"] is (
+        missing_side != "right"
+    )
+    assert update["trace"][-1] == {
+        "node": "execute_clause_comparison",
+        "tool": "compare_clauses",
+        "left_found": missing_side != "left",
+        "right_found": missing_side != "right",
+    }
+
+
+def test_graph_injects_dependencies_into_regulation_qa() -> None:
+    evidence = [{"source_id": "GBT-22239", "text": "grounded clause"}]
+    tools = FakeTools(search_results=evidence)
+    llm = FakeLLM()
+
+    graph = build_graph(
+        lambda _query, _control_text: "regulation_qa",
+        tools,
+        llm,
+    )
+    result = graph.invoke(
+        {
+            "request_id": "req-graph-qa",
+            "query": "What does the regulation require?",
+            "control_text": "",
+            "tool_calls": [],
+            "trace": [{"node": "received"}],
+        }
+    )
+
+    assert result["answer"] == "grounded regulation answer"
+    assert result["evidence"] == evidence
+    assert [call["tool"] for call in tools.calls] == ["search_regulation"]
+    assert llm.calls == [{"query": result["query"], "evidence": evidence}]
+
+
+def test_graph_injects_dependencies_into_clause_comparison() -> None:
+    comparison = {
+        "left": {"source_id": "LEFT", "text": "left clause"},
+        "right": {"source_id": "RIGHT", "text": "right clause"},
+        "dimensions": ["requirement", "scope"],
+    }
+    tools = FakeTools(comparison_result=comparison)
+    llm = FakeLLM()
+
+    graph = build_graph(
+        lambda _query, _control_text: "clause_comparison",
+        tools,
+        llm,
+    )
+    result = graph.invoke(
+        {
+            "request_id": "req-graph-comparison",
+            "query": "Compare the two clauses.",
+            "control_text": "",
+            "tool_calls": [],
+            "trace": [{"node": "received"}],
+        }
+    )
+
+    assert result["answer"] == "grounded comparison answer"
+    assert result["evidence"] == [comparison["left"], comparison["right"]]
+    assert [call["tool"] for call in tools.calls] == ["compare_clauses"]
+    assert llm.comparison_answer_calls == [
+        {"query": result["query"], "comparison": comparison}
+    ]
+
+
 @pytest.mark.parametrize(
-    ("intent", "expected_valid"),
+    ("intent", "evidence", "expected_valid"),
     [
-        ("regulation_qa", True),
-        ("unsupported", False),
+        ("regulation_qa", [{"source_id": "SOURCE"}], True),
+        ("regulation_qa", [], False),
+        (
+            "clause_comparison",
+            [{"source_id": "LEFT"}, {"source_id": "RIGHT"}],
+            True,
+        ),
+        ("clause_comparison", [{"source_id": "LEFT"}], False),
+        ("gap_analysis", [], True),
+        ("unsupported", [], False),
     ],
 )
 def test_verify_records_deterministic_result(
     intent: str,
+    evidence: list[dict],
     expected_valid: bool,
 ) -> None:
     state: AgentState = {
         "intent": intent,
+        "evidence": evidence,
         "trace": [{"node": "execute_workflow"}],
     }
 
@@ -238,18 +531,18 @@ def test_verify_records_deterministic_result(
 
 
 @pytest.mark.parametrize(
-    ("intent", "expected_status"),
+    ("citations_valid", "expected_status"),
     [
-        ("regulation_qa", "completed"),
-        ("unsupported", "refused"),
+        (True, "completed"),
+        (False, "refused"),
     ],
 )
 def test_finish_sets_explicit_status_and_trace(
-    intent: str,
+    citations_valid: bool,
     expected_status: str,
 ) -> None:
     state: AgentState = {
-        "intent": intent,
+        "citations_valid": citations_valid,
         "trace": [{"node": "verify"}],
     }
 
@@ -260,6 +553,62 @@ def test_finish_sets_explicit_status_and_trace(
         {"node": "verify"},
         {"node": "finish", "final_status": expected_status},
     ]
+
+
+def test_graph_refuses_regulation_qa_without_evidence() -> None:
+    tools = FakeTools(search_results=[])
+    llm = FakeLLM()
+    graph = build_graph(
+        lambda _query, _control_text: "regulation_qa",
+        tools,
+        llm,
+    )
+
+    result = graph.invoke(
+        {
+            "request_id": "req-empty-qa",
+            "query": "An ungrounded regulation question",
+            "control_text": "",
+            "tool_calls": [],
+            "trace": [{"node": "received"}],
+        }
+    )
+
+    assert result["answer"] == "insufficient regulation evidence"
+    assert result["citations_valid"] is False
+    assert result["final_status"] == "refused"
+    assert llm.calls == []
+
+
+def test_graph_refuses_comparison_with_one_missing_side() -> None:
+    tools = FakeTools(
+        comparison_result={
+            "left": {"source_id": "LEFT", "text": "left clause"},
+            "right": None,
+            "dimensions": ["requirement"],
+        }
+    )
+    llm = FakeLLM()
+    graph = build_graph(
+        lambda _query, _control_text: "clause_comparison",
+        tools,
+        llm,
+    )
+
+    result = graph.invoke(
+        {
+            "request_id": "req-incomplete-comparison",
+            "query": "Compare two clauses",
+            "control_text": "",
+            "tool_calls": [],
+            "trace": [{"node": "received"}],
+        }
+    )
+
+    assert result["answer"] == "incomplete comparison evidence"
+    assert result["citations_valid"] is False
+    assert result["final_status"] == "refused"
+    assert llm.comparison_answer_calls == []
 
 
 @pytest.mark.parametrize(
@@ -273,14 +622,14 @@ def test_finish_sets_explicit_status_and_trace(
         (
             "regulation_qa",
             "execute_regulation_qa",
-            "completed",
-            True,
+            "refused",
+            False,
         ),
         (
             "clause_comparison",
             "execute_clause_comparison",
-            "completed",
-            True,
+            "refused",
+            False,
         ),
         (
             "gap_analysis",
@@ -306,7 +655,7 @@ def test_graph_routes_each_intent_through_verify_and_finish(
     def fake_classifier(_query: str, _control_text: str) -> str:
         return intent
 
-    graph = build_graph(fake_classifier, fake_tools)
+    graph = build_graph(fake_classifier, fake_tools, FakeLLM())
 
     result = graph.invoke(
         {
@@ -338,6 +687,7 @@ def test_graph_diagram_exposes_all_conditional_paths(
     graph = build_graph(
         lambda _query, _control_text: "regulation_qa",
         fake_tools,
+        FakeLLM(),
     )
     edges = {
         (edge.source, edge.target)

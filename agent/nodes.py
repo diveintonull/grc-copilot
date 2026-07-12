@@ -35,19 +35,82 @@ def select_workflow(state: AgentState) -> str:
         raise ValueError(f"unknown intent: {intent}")
 
 
-def execute_regulation_qa(state: AgentState) -> dict:
-    """Return a deterministic placeholder for the regulation-QA route."""
+def execute_regulation_qa(state: AgentState, tools, llm) -> dict:
+    """Search regulation evidence and produce an evidence-aware answer."""
+    query = state["query"]
+    evidence = tools.search_regulation(query, None)
+
+    tool_call = {
+        "tool": "search_regulation",
+        "query": query,
+        "source_ids": None,
+        "result_count": len(evidence),
+    }
+    new_trace = {
+        "node": "execute_regulation_qa",
+        "tool": "search_regulation",
+        "result_count": len(evidence),
+    }
+
+    if evidence:
+        answer = llm.answer_regulation(query, evidence)
+    else:
+        answer = "insufficient regulation evidence"
+
     return {
-        "answer": "fake regulation_qa result",
-        "trace": state["trace"] + [{"node": "execute_regulation_qa"}],
+        "answer": answer,
+        "tool_calls": state.get("tool_calls", []) + [tool_call],
+        "evidence": evidence,
+        "trace": state["trace"] + [new_trace],
     }
 
 
-def execute_clause_comparison(state: AgentState) -> dict:
-    """Return a deterministic placeholder for the comparison route."""
+def execute_clause_comparison(state: AgentState, tools, llm) -> dict:
+    """Compare two precisely identified clauses when both sides exist."""
+    query = state["query"]
+    plan = llm.plan_comparison(query)
+
+    comparison = tools.compare_clauses(
+        plan["left"],
+        plan["right"],
+        plan["dimensions"],
+    )
+
+    left_evidence = comparison["left"]
+    right_evidence = comparison["right"]
+    left_found = left_evidence is not None
+    right_found = right_evidence is not None
+
+    evidence = [
+        item
+        for item in [left_evidence, right_evidence]
+        if item is not None
+    ]
+    tool_call = {
+        "tool": "compare_clauses",
+        "left": plan["left"],
+        "right": plan["right"],
+        "dimensions": plan["dimensions"],
+        "left_found": left_found,
+        "right_found": right_found,
+    }
+    new_trace = {
+        "node": "execute_clause_comparison",
+        "tool": "compare_clauses",
+        "left_found": left_found,
+        "right_found": right_found,
+    }
+
+    if left_found and right_found:
+        answer = llm.answer_comparison(query, comparison)
+    else:
+        answer = "incomplete comparison evidence"
+
     return {
-        "answer": "fake clause_comparison result",
-        "trace": state["trace"] + [{"node": "execute_clause_comparison"}],
+        "answer": answer,
+        "tool_calls": state.get("tool_calls", []) + [tool_call],
+        "evidence": evidence,
+        "trace": state["trace"] + [new_trace],
     }
 
 
@@ -69,7 +132,18 @@ def execute_unsupported(state: AgentState, tools) -> dict:
 
 def verify(state: AgentState) -> dict:
     """Return the deterministic verification update for a routed request."""
-    citations_valid = state["intent"] != "unsupported"
+    intent = state["intent"]
+    evidence = state.get("evidence", [])
+
+    if intent == "regulation_qa":
+        citations_valid = bool(evidence)
+    elif intent == "clause_comparison":
+        citations_valid = len(evidence) == 2
+    elif intent == "gap_analysis":
+        citations_valid = True
+    else:
+        citations_valid = False
+
     return {
         "citations_valid": citations_valid,
         "trace": state["trace"] + [
@@ -83,7 +157,9 @@ def verify(state: AgentState) -> dict:
 
 def finish(state: AgentState) -> dict:
     """Return the final status update and terminal trace event."""
-    final_status = "refused" if state["intent"] == "unsupported" else "completed"
+    citations_valid = state["citations_valid"]
+    final_status = "completed" if citations_valid else "refused"
+
     return {
         "final_status": final_status,
         "trace": state["trace"] + [
