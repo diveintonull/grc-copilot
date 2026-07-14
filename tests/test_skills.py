@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.nodes import load_skill_node, match_skill_node
 from agent.skills import (
     SkillFormatError,
     SkillPathError,
@@ -191,3 +192,51 @@ def test_declared_resource_must_exist(tmp_path: Path) -> None:
 
     with pytest.raises(SkillPathError, match="resource does not exist"):
         load_skill("regulation-qa", catalog)
+
+
+@pytest.mark.parametrize(
+    ("intent", "skill_name"),
+    [
+        ("regulation_qa", "regulation-qa"),
+        ("clause_comparison", "clause-comparison"),
+        ("gap_analysis", "gap-analysis"),
+    ],
+)
+def test_skill_nodes_load_each_supported_intent_with_token_trace(
+    tmp_path: Path,
+    intent: str,
+    skill_name: str,
+) -> None:
+    body = f"{skill_name} runtime instructions"
+    write_skill(
+        tmp_path,
+        skill_name,
+        description=f"Instructions for {skill_name}",
+        body=body,
+    )
+    tokenizer = SpyTokenizer()
+    catalog = discover_skills(tmp_path, tokenizer=tokenizer)
+    state = {
+        "intent": intent,
+        "trace": [{"node": "route_intent", "intent": intent}],
+    }
+
+    match_update = match_skill_node(state, catalog)
+    state.update(match_update)
+    load_update = load_skill_node(state, catalog)
+
+    assert match_update["active_skill"] == skill_name
+    assert match_update["trace"][-1] == {
+        "node": "match_skill",
+        "intent": intent,
+        "matched_skill": skill_name,
+        "catalog_tokens": catalog.catalog_tokens,
+    }
+    assert load_update["skill_text"] == body
+    assert load_update["trace"][-1] == {
+        "node": "load_skill",
+        "matched_skill": skill_name,
+        "loaded": True,
+        "body_tokens": len(body.split()),
+        "resource_tokens": 0,
+    }

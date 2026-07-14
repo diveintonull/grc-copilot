@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from html import escape
 
+from agent.skills import (
+    SkillCatalog,
+    load_skill as load_skill_from_catalog,
+    match_skill as match_skill_from_catalog,
+)
 from agent.state import AgentState
 from rag.citations import EntailmentEvaluator, validate_citations
 
@@ -107,6 +112,65 @@ def route_intent(state: AgentState, classify_intent) -> dict:
     }
 
 
+def match_skill_node(
+    state: AgentState,
+    catalog: SkillCatalog,
+) -> dict:
+    """Match one routed intent to at most one available Skill."""
+    matched_skill = match_skill_from_catalog(state["intent"], catalog)
+
+    return {
+        "active_skill": matched_skill or "",
+        "trace": state["trace"] + [
+            {
+                "node": "match_skill",
+                "intent": state["intent"],
+                "matched_skill": matched_skill,
+                "catalog_tokens": catalog.catalog_tokens,
+            }
+        ],
+    }
+
+
+def load_skill_node(
+    state: AgentState,
+    catalog: SkillCatalog,
+) -> dict:
+    """Load the matched Skill body after a successful selection."""
+    matched_skill = state.get("active_skill") or None
+
+    if matched_skill is None:
+        return {
+            "active_skill": "",
+            "skill_text": "",
+            "trace": state["trace"] + [
+                {
+                    "node": "load_skill",
+                    "matched_skill": None,
+                    "loaded": False,
+                    "body_tokens": 0,
+                    "resource_tokens": 0,
+                }
+            ],
+        }
+
+    loaded = load_skill_from_catalog(matched_skill, catalog)
+
+    return {
+        "active_skill": loaded.name,
+        "skill_text": loaded.text,
+        "trace": state["trace"] + [
+            {
+                "node": "load_skill",
+                "matched_skill": loaded.name,
+                "loaded": True,
+                "body_tokens": loaded.token_usage["body"],
+                "resource_tokens": loaded.token_usage["resources"],
+            }
+        ],
+    }
+
+
 def select_workflow(state: AgentState) -> str:
     """Return the next workflow node name for the classified intent."""
     intent = state["intent"]
@@ -141,7 +205,11 @@ def execute_regulation_qa(state: AgentState, tools, llm) -> dict:
     }
 
     if evidence:
-        answer = llm.answer_regulation(query, _bound_evidence(evidence))
+        answer = llm.answer_regulation(
+            query,
+            _bound_evidence(evidence),
+            skill_text=state.get("skill_text", ""),
+        )
     else:
         answer = "insufficient regulation evidence"
 
@@ -156,7 +224,10 @@ def execute_regulation_qa(state: AgentState, tools, llm) -> dict:
 def execute_clause_comparison(state: AgentState, tools, llm) -> dict:
     """Compare two precisely identified clauses when both sides exist."""
     query = state["query"]
-    plan = llm.plan_comparison(query)
+    plan = llm.plan_comparison(
+        query,
+        skill_text=state.get("skill_text", ""),
+    )
 
     comparison = tools.compare_clauses(
         plan["left"],
@@ -195,7 +266,11 @@ def execute_clause_comparison(state: AgentState, tools, llm) -> dict:
             "right": _bound_evidence_item(right_evidence),
             "dimensions": comparison["dimensions"],
         }
-        answer = llm.answer_comparison(query, bounded_comparison)
+        answer = llm.answer_comparison(
+            query,
+            bounded_comparison,
+            skill_text=state.get("skill_text", ""),
+        )
     else:
         answer = "incomplete comparison evidence"
 
@@ -227,7 +302,10 @@ def execute_gap_analysis(state: AgentState, tools, llm) -> dict:
             ],
         }
 
-    controls = llm.extract_controls(control_text)
+    controls = llm.extract_controls(
+        control_text,
+        skill_text=state.get("skill_text", ""),
+    )
     regulation_evidence = tools.search_regulation(query, None)
     tool_call = {
         "tool": "search_regulation",
@@ -241,6 +319,7 @@ def execute_gap_analysis(state: AgentState, tools, llm) -> dict:
             query,
             controls,
             _bound_evidence(regulation_evidence),
+            skill_text=state.get("skill_text", ""),
         )
         gap_matrix = _restore_gap_evidence(
             generated_gap_matrix,

@@ -15,6 +15,8 @@ from agent.nodes import (
     execute_regulation_qa,
     execute_unsupported,
     finish,
+    load_skill_node,
+    match_skill_node,
     prepare_retry,
     route_intent,
     select_after_post_workflow_cancel,
@@ -22,6 +24,7 @@ from agent.nodes import (
     select_after_verify,
     verify,
 )
+from agent.skills import SkillCatalog, discover_skills
 from agent.state import AgentState
 
 
@@ -41,10 +44,22 @@ def build_graph(
     *,
     entailment_evaluator=None,
     is_cancelled=None,
+    skill_catalog: SkillCatalog | None = None,
 ) -> Any:
     """Build the compiled routing graph from injected runtime dependencies."""
     builder = create_graph_builder()
+
+    selected_skill_catalog = (
+        skill_catalog
+        if skill_catalog is not None
+        else discover_skills(Path("skills"))
+    )
+
     route_node = partial(route_intent, classify_intent=classify_intent)
+
+    match_node = partial(match_skill_node, catalog=selected_skill_catalog)
+    load_node = partial(load_skill_node, catalog=selected_skill_catalog)
+
     unsupported_node = partial(execute_unsupported, tools=tools)
     regulation_qa_node = partial(
         execute_regulation_qa,
@@ -79,6 +94,8 @@ def build_graph(
     retry_node = partial(prepare_retry, llm=llm)
 
     builder.add_node("route_intent", route_node)
+    builder.add_node("match_skill", match_node)
+    builder.add_node("load_skill", load_node)
     builder.add_node(
         "check_cancel_before_workflow",
         pre_workflow_cancel_node,
@@ -96,7 +113,9 @@ def build_graph(
     builder.add_node("finish", finish)
 
     builder.add_edge(START, "route_intent")
-    builder.add_edge("route_intent", "check_cancel_before_workflow")
+    builder.add_edge("route_intent", "match_skill")
+    builder.add_edge("match_skill", "load_skill")
+    builder.add_edge("load_skill", "check_cancel_before_workflow")
     builder.add_conditional_edges(
         "check_cancel_before_workflow",
         select_after_pre_workflow_cancel,
