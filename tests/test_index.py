@@ -105,6 +105,25 @@ def test_bge_model_loader_passes_cpu_without_model_kwargs(monkeypatch):
     }
 
 
+def test_qdrant_client_uses_configured_container_url(monkeypatch):
+    calls = {}
+
+    class ConfiguredClient:
+        def __init__(self, *, url):
+            calls["url"] = url
+
+    monkeypatch.setenv("QDRANT_URL", "http://qdrant:6333")
+    monkeypatch.setitem(
+        sys.modules,
+        "qdrant_client",
+        SimpleNamespace(QdrantClient=ConfiguredClient),
+    )
+
+    index_module._client()
+
+    assert calls == {"url": "http://qdrant:6333"}
+
+
 class FakeVector(list):
     def tolist(self):
         return list(self)

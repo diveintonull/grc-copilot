@@ -266,9 +266,36 @@ def test_health_reports_active_task_count() -> None:
 
     with TestClient(app) as client:
         response = client.get("/health")
+        readiness = client.get("/ready")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "active_tasks": 0}
+    assert readiness.status_code == 200
+    assert readiness.json() == {"status": "ready"}
+
+
+def test_chat_rejects_work_while_runtime_dependency_is_unready() -> None:
+    runner_called = False
+
+    async def runner(_request) -> dict:
+        nonlocal runner_called
+        runner_called = True
+        return {"answer": "must not run"}
+
+    async def unready() -> bool:
+        return False
+
+    app = create_app(agent_runner=runner, readiness_probe=unready)
+
+    with TestClient(app) as client:
+        readiness = client.get("/ready")
+        response = client.post("/chat", json={"query": "test"})
+
+    assert readiness.status_code == 503
+    assert readiness.json()["detail"] == "service dependency is not ready"
+    assert response.status_code == 503
+    assert runner_called is False
+    assert app.state.task_manager.active_count == 0
 
 
 def test_chat_rejects_blank_query_before_starting_task() -> None:

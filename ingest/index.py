@@ -14,6 +14,7 @@ CLI:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -79,7 +80,7 @@ DOCUMENT_SPECS = {
 COLLECTION = "grc_kb"
 MODEL_NAME = "BAAI/bge-m3"
 BGE_M3_DIM = 1024
-QDRANT_URL = "http://localhost:6333"
+DEFAULT_QDRANT_URL = "http://localhost:6333"
 PARENTS_STORE = PARSED / "_parents_store.json"
 
 
@@ -170,7 +171,8 @@ def embed(model, texts: list[str]):
 def _client():
     from qdrant_client import QdrantClient
 
-    return QdrantClient(url=QDRANT_URL)
+    url = os.environ.get("QDRANT_URL", DEFAULT_QDRANT_URL)
+    return QdrantClient(url=url)
 
 
 def index() -> int:

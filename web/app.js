@@ -409,7 +409,7 @@ class GRCApplication {
 
   async checkHealth() {
     try {
-      const response = await fetch("/health", {
+      const response = await fetch("/ready", {
         headers: { Accept: "application/json" },
       });
       if (!response.ok) {

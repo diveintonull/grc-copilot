@@ -59,6 +59,7 @@ class ChatRequest(BaseModel):
 
 
 AgentRunner = Callable[[ChatRequest], Awaitable[Mapping[str, Any]]]
+ReadinessProbe = Callable[[], Awaitable[bool]]
 
 
 async def _unconfigured_runner(_request: ChatRequest) -> Mapping[str, Any]:
@@ -268,6 +269,7 @@ def create_app(
     *,
     agent_runner: AgentRunner | None = None,
     task_manager: TaskManager | None = None,
+    readiness_probe: ReadinessProbe | None = None,
     text_chunk_size: int = DEFAULT_TEXT_CHUNK_SIZE,
 ) -> FastAPI:
     """Create an app with explicit runner and task lifecycle dependencies."""
@@ -285,13 +287,38 @@ def create_app(
     application = FastAPI(title="GRC Copilot API", lifespan=lifespan)
     application.state.task_manager = manager
     application.state.agent_runner = runner
+    application.state.readiness_probe = readiness_probe
+
+    async def dependencies_ready() -> bool:
+        if readiness_probe is None:
+            return True
+        try:
+            return bool(await readiness_probe())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
 
     @application.get("/health")
     async def health() -> dict[str, Any]:
         return {"status": "ok", "active_tasks": manager.active_count}
 
+    @application.get("/ready")
+    async def ready() -> dict[str, str]:
+        if not await dependencies_ready():
+            raise HTTPException(
+                status_code=503,
+                detail="service dependency is not ready",
+            )
+        return {"status": "ready"}
+
     @application.post("/chat")
     async def chat(request: ChatRequest) -> StreamingResponse:
+        if not await dependencies_ready():
+            raise HTTPException(
+                status_code=503,
+                detail="service dependency is not ready",
+            )
         request_id = request.request_id or str(uuid4())
         bound_request = request.model_copy(
             update={"request_id": request_id}

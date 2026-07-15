@@ -1,0 +1,60 @@
+name: grc-copilot
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      APP_RUN_MODE: ${APP_RUN_MODE:-demo}
+      EMBED_MODEL_SOURCE: ${EMBED_MODEL_SOURCE:-modelscope}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      QDRANT_URL: http://qdrant:6333
+    ports:
+      - "127.0.0.1:${APP_HOST_PORT:-8000}:8000"
+    volumes:
+      - model_cache:/home/app/.cache
+    depends_on:
+      qdrant:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=2).close()
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    ports:
+      - "127.0.0.1:${QDRANT_HOST_PORT:-6333}:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      test:
+        - CMD
+        - /bin/bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/6333 &&
+          printf 'GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '200 OK' <&3
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  model_cache:
+  qdrant_storage:
