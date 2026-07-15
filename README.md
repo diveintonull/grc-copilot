@@ -95,16 +95,6 @@ valid=60 invalid=0
 
 Raw corpus files and built indexes are intentionally excluded from Git. Source provenance is tracked in [SOURCES.md](SOURCES.md).
 
-## Measured highlights
-
-| Controlled experiment | Observed result |
-|---|---|
-| Parent-child vs. fixed-window chunking | Recall@5 increased from 50.00% to 69.15% under the same Dense, no-rerank setup |
-| Reranking parent-child evidence | Recall@5 reached 81.91% |
-| Progressive Skills vs. loading all SOPs | 59.46% fewer average input tokens and 91.67% structured success on the fixed 12-case Skill subset |
-
-These are scoped ablation results rather than production accuracy claims. The repository keeps the evaluation dataset, metrics, and runners reproducible under `evals/`.
-
 ## Safety and limitations
 
 - Retrieved text is treated as untrusted input and wrapped in escaped evidence boundaries.
